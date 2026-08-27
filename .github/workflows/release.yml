@@ -28,6 +28,11 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  # Platforms baked into every published manifest list. The Trivy steps below
+  # iterate this same list, so adding a platform here widens the CVE gate too —
+  # but remember to add a matching "Upload Trivy results" step, since each needs
+  # its own SARIF category.
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -104,6 +109,15 @@ jobs:
             echo "Dry run mode - image will be built only"
           fi
 
+      # Registers binfmt handlers for the foreign-arch RUN steps in the final
+      # image stages (apk add, adduser, chmod) — the builder stages themselves are
+      # pinned to $BUILDPLATFORM and run natively, so almost nothing is emulated.
+      # Must come BEFORE setup-buildx-action: buildkitd determines which platforms
+      # it can serve when it starts, so a builder booted before binfmt is
+      # registered may never advertise linux/arm64.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -168,6 +182,11 @@ jobs:
           file: ${{ matrix.dockerfile }}
           # Empty for default-stage images; set to `migrate` for the migrator.
           target: ${{ matrix.target }}
+          # Publishes one manifest list per tag. steps.build.outputs.digest then
+          # refers to that list rather than a single platform's image, which is
+          # precisely what release-digests.json should pin — an
+          # image@sha256:<list-digest> reference resolves per node architecture.
+          platforms: ${{ env.PLATFORMS }}
           push: ${{ steps.release-mode.outputs.enabled == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -204,34 +223,111 @@ jobs:
         with:
           version: v0.69.3
 
+      # The tag now points at a manifest list, and `trivy image` resolves one to a
+      # single entry (the runner's own platform) instead of scanning them all — so
+      # each platform is scanned explicitly, or arm64 would ship unscanned past the
+      # gate. --platform needs the full os/arch form: a bare `arm64` is parsed as an
+      # OS name and silently matches nothing.
+      #
+      # --exit-code 0 keeps a finding from aborting the loop and costing us the
+      # remaining platforms' reports. Pass/fail moved to "Enforce Trivy gate" below,
+      # which is also what makes the upload reachable on the runs that found
+      # something: while the scan itself gated on --exit-code 1, a scan that found
+      # CVEs counted as failed and its SARIF was never uploaded, so the Security tab
+      # only ever received clean reports.
       - name: Run Trivy vulnerability scanner
         id: trivy-scan
         if: steps.release-mode.outputs.enabled == 'true'
+        env:
+          IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
         run: |
-          trivy image \
-            --severity HIGH,CRITICAL \
-            --ignore-unfixed \
-            --format sarif \
-            --output "trivy-${{ matrix.image_name }}.sarif" \
-            --exit-code 1 \
-            "${{ fromJSON(steps.meta.outputs.json).tags[0] }}"
+          # This step deliberately never fails. A transient failure on one platform
+          # must not discard the SARIF already written for another, nor skip the
+          # uploads below — both the scan failures and the findings are adjudicated
+          # by "Enforce Trivy gate".
+          FAILED_PLATFORMS=""
+          for PLATFORM in ${PLATFORMS//,/ }; do
+            SLUG="${PLATFORM//\//-}"
+            echo "::group::Trivy ${{ matrix.image_name }} ${PLATFORM}"
+            # --image-src remote is load-bearing, not a default restated: the
+            # `docker` source has priority by default and silently IGNORES
+            # --platform, reporting the daemon's own copy instead. That is inert
+            # while nothing loads the tag locally, but it would quietly turn both
+            # per-platform scans into two scans of the same arch.
+            if trivy image \
+                 --image-src remote \
+                 --platform "$PLATFORM" \
+                 --severity HIGH,CRITICAL \
+                 --ignore-unfixed \
+                 --format sarif \
+                 --output "trivy-${{ matrix.image_name }}-${SLUG}.sarif" \
+                 --exit-code 0 \
+                 "$IMAGE_REF"; then
+              # Same scan again for a human-readable table; Trivy's DB and layer
+              # caches are warm by now, so this is cheap. Never fatal: the SARIF
+              # above is the authoritative artifact.
+              trivy image \
+                --image-src remote \
+                --platform "$PLATFORM" \
+                --severity HIGH,CRITICAL \
+                --ignore-unfixed \
+                --format table \
+                --exit-code 0 \
+                "$IMAGE_REF" || true
+            else
+              echo "::error::Trivy could not scan ${PLATFORM} — the gate below will fail."
+              FAILED_PLATFORMS="${FAILED_PLATFORMS} ${PLATFORM}"
+            fi
+            echo "::endgroup::"
+          done
+          echo "failed_platforms=${FAILED_PLATFORMS# }" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Trivy results
-        if: always() && steps.trivy-scan.outcome == 'success'
+      # One upload per (image, platform). The category must be unique per upload:
+      # two uploads from the same tool sharing a category is treated as a
+      # misconfiguration and fails the whole run, not just the second upload.
+      # outcome == 'success' now means "the scan completed", not "found nothing".
+      # The hashFiles guard keeps a narrowed PLATFORMS (or a platform that failed
+      # to scan) from failing the run here, after the images are already pushed.
+      # An unscanned platform is still caught — by the gate, which is the right
+      # place for it.
+      - name: Upload Trivy results (linux/amd64)
+        if: always() && steps.trivy-scan.outcome == 'success' && hashFiles(format('trivy-{0}-linux-amd64.sarif', matrix.image_name)) != ''
         uses: github/codeql-action/upload-sarif@v4.37.8
         with:
-          sarif_file: trivy-${{ matrix.image_name }}.sarif
-          # Distinct category per image so the two matrix uploads don't overwrite each other.
-          category: ${{ matrix.image_name }}
+          sarif_file: trivy-${{ matrix.image_name }}-linux-amd64.sarif
+          category: ${{ matrix.image_name }}-linux-amd64
 
-      - name: Print Trivy findings (debug)
-        if: always() && steps.trivy-scan.outcome != 'skipped'
+      - name: Upload Trivy results (linux/arm64)
+        if: always() && steps.trivy-scan.outcome == 'success' && hashFiles(format('trivy-{0}-linux-arm64.sarif', matrix.image_name)) != ''
+        uses: github/codeql-action/upload-sarif@v4.37.8
+        with:
+          sarif_file: trivy-${{ matrix.image_name }}-linux-arm64.sarif
+          category: ${{ matrix.image_name }}-linux-arm64
+
+      # The gate the scan used to apply itself. Runs after the uploads so the
+      # findings reach the Security tab even on the runs this fails.
+      - name: Enforce Trivy gate
+        if: always() && steps.trivy-scan.outcome == 'success'
         run: |
-          trivy image \
-            --severity HIGH,CRITICAL \
-            --ignore-unfixed \
-            --format table \
-            ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          # An unscanned platform is a gate failure, not a pass: otherwise a
+          # transient Trivy error would wave a platform through unexamined.
+          if [ -n "${{ steps.trivy-scan.outputs.failed_platforms }}" ]; then
+            echo "::error::Trivy did not scan: ${{ steps.trivy-scan.outputs.failed_platforms }} — refusing to pass an unscanned platform."
+            exit 1
+          fi
+          FAILED=0
+          for FILE in trivy-${{ matrix.image_name }}-*.sarif; do
+            COUNT=$(jq '[.runs[].results[]] | length' "$FILE")
+            echo "$FILE: $COUNT fixable HIGH/CRITICAL finding(s)"
+            if [ "$COUNT" -gt 0 ]; then
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Fixable HIGH/CRITICAL CVEs found in ${{ matrix.image_name }} — see the job log and the Security tab."
+            exit 1
+          fi
+          echo "No fixable HIGH/CRITICAL CVEs on any published platform."
 
       - name: Generate service summary
         if: always()
@@ -369,6 +465,11 @@ jobs:
             docker pull ${{ env.REGISTRY }}/${{ steps.repo_owner.outputs.owner }}/tnsw-api:${{ needs.collate-digests.outputs.version }}
             docker pull ${{ env.REGISTRY }}/${{ steps.repo_owner.outputs.owner }}/tnsw-migrate:${{ needs.collate-digests.outputs.version }}
             ```
+
+            ### Supported Platforms
+            Every image above is a multi-arch manifest list covering
+            `linux/amd64` and `linux/arm64` — one tag resolves correctly on
+            both x86_64 and arm64 (Graviton/Ampere) nodes, and on Apple Silicon.
 
             ### Image Digests
             See `release-digests.json` attached to this release for the exact SHA256 digest
