@@ -29,7 +29,7 @@ on:
 env:
   REGISTRY: ghcr.io
   # Platforms baked into every published manifest list. The Trivy steps below
-  # iterate this same list, so adding a platform here widens the CVE gate too —
+  # iterate this same list, so adding a platform here widens CVE reporting too —
   # but remember to add a matching "Upload Trivy results" step, since each needs
   # its own SARIF category.
   PLATFORMS: linux/amd64,linux/arm64
@@ -216,25 +216,26 @@ jobs:
           path: /tmp/digests/${{ matrix.image_name }}.txt
           retention-days: 1
 
-      # Trivy scans the pushed image for CRITICAL/HIGH CVEs.
+      # Trivy scans the pushed image for CRITICAL/HIGH CVEs and REPORTS them; it
+      # does not gate the release. See "Report Trivy findings" below for why.
       - name: Setup Trivy
         if: steps.release-mode.outputs.enabled == 'true'
         uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567
         with:
           version: v0.69.3
 
-      # The tag now points at a manifest list, and `trivy image` resolves one to a
+      # The tag points at a manifest list, and `trivy image` resolves one to a
       # single entry (the runner's own platform) instead of scanning them all — so
-      # each platform is scanned explicitly, or arm64 would ship unscanned past the
-      # gate. --platform needs the full os/arch form: a bare `arm64` is parsed as an
-      # OS name and silently matches nothing.
+      # each platform is scanned explicitly, or the arm64 image would be published
+      # with nobody ever having looked at it. --platform needs the full os/arch
+      # form: a bare `arm64` is parsed as an OS name and silently matches nothing.
       #
-      # --exit-code 0 keeps a finding from aborting the loop and costing us the
-      # remaining platforms' reports. Pass/fail moved to "Enforce Trivy gate" below,
-      # which is also what makes the upload reachable on the runs that found
-      # something: while the scan itself gated on --exit-code 1, a scan that found
-      # CVEs counted as failed and its SARIF was never uploaded, so the Security tab
-      # only ever received clean reports.
+      # --exit-code 0 everywhere: a finding is something to report, not something to
+      # abort on, and aborting mid-loop would cost us the remaining platforms'
+      # reports. It is also what makes the SARIF upload reachable at all — while the
+      # scan gated on --exit-code 1, a scan that found CVEs counted as failed and
+      # its SARIF was never uploaded, so the Security tab only ever received clean
+      # reports.
       - name: Run Trivy vulnerability scanner
         id: trivy-scan
         if: steps.release-mode.outputs.enabled == 'true'
@@ -243,8 +244,8 @@ jobs:
         run: |
           # This step deliberately never fails. A transient failure on one platform
           # must not discard the SARIF already written for another, nor skip the
-          # uploads below — both the scan failures and the findings are adjudicated
-          # by "Enforce Trivy gate".
+          # uploads below — the scan failures and the findings are both summarised
+          # by "Report Trivy findings".
           FAILED_PLATFORMS=""
           for PLATFORM in ${PLATFORMS//,/ }; do
             SLUG="${PLATFORM//\//-}"
@@ -275,7 +276,7 @@ jobs:
                 --exit-code 0 \
                 "$IMAGE_REF" || true
             else
-              echo "::error::Trivy could not scan ${PLATFORM} — the gate below will fail."
+              echo "::warning::Trivy could not scan ${PLATFORM} — it is reported as unscanned below."
               FAILED_PLATFORMS="${FAILED_PLATFORMS} ${PLATFORM}"
             fi
             echo "::endgroup::"
@@ -288,8 +289,7 @@ jobs:
       # outcome == 'success' now means "the scan completed", not "found nothing".
       # The hashFiles guard keeps a narrowed PLATFORMS (or a platform that failed
       # to scan) from failing the run here, after the images are already pushed.
-      # An unscanned platform is still caught — by the gate, which is the right
-      # place for it.
+      # An unscanned platform is still called out — by the report step below.
       - name: Upload Trivy results (linux/amd64)
         if: always() && steps.trivy-scan.outcome == 'success' && hashFiles(format('trivy-{0}-linux-amd64.sarif', matrix.image_name)) != ''
         uses: github/codeql-action/upload-sarif@v4.37.8
@@ -304,30 +304,55 @@ jobs:
           sarif_file: trivy-${{ matrix.image_name }}-linux-arm64.sarif
           category: ${{ matrix.image_name }}-linux-arm64
 
-      # The gate the scan used to apply itself. Runs after the uploads so the
-      # findings reach the Security tab even on the runs this fails.
-      - name: Enforce Trivy gate
+      # Report-only, by design: this step cannot fail the release.
+      #
+      # A base-image CVE is published on the CVE feed's schedule, not ours, and
+      # often has no fix we can apply on the day it lands — the patched apk can
+      # exist while the base image we FROM has not been rebuilt with it yet.
+      # Gating on that means an unrelated upstream advisory blocks a shipment, and
+      # the usual response to a gate like that is to bypass it, which is worse than
+      # not having one. So the findings are surfaced in three places a human
+      # actually reads — the scanner step's table, Security → Code scanning, and
+      # the run summary below — and triaged there instead.
+      #
+      # Runs after the uploads so the alerts are already in the Security tab by the
+      # time the summary points at them.
+      - name: Report Trivy findings
         if: always() && steps.trivy-scan.outcome == 'success'
         run: |
-          # An unscanned platform is a gate failure, not a pass: otherwise a
-          # transient Trivy error would wave a platform through unexamined.
-          if [ -n "${{ steps.trivy-scan.outputs.failed_platforms }}" ]; then
-            echo "::error::Trivy did not scan: ${{ steps.trivy-scan.outputs.failed_platforms }} — refusing to pass an unscanned platform."
-            exit 1
+          {
+            echo "### ${{ matrix.image_name }} — image CVEs (report only)"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          UNSCANNED="${{ steps.trivy-scan.outputs.failed_platforms }}"
+          if [ -n "$UNSCANNED" ]; then
+            echo "::warning::Trivy could not scan: ${UNSCANNED} — published without a CVE report for those platforms."
+            {
+              echo "> **Not scanned:** \`${UNSCANNED}\` — published without a CVE report for those platforms."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
-          FAILED=0
+
+          # `[ -e ]` guards the no-match case, where the unexpanded glob would
+          # otherwise reach jq as a literal filename. Reachable now that nothing
+          # exits early when every platform failed to scan.
+          TOTAL=0
           for FILE in trivy-${{ matrix.image_name }}-*.sarif; do
+            [ -e "$FILE" ] || continue
             COUNT=$(jq '[.runs[].results[]] | length' "$FILE")
+            TOTAL=$(( TOTAL + COUNT ))
             echo "$FILE: $COUNT fixable HIGH/CRITICAL finding(s)"
-            if [ "$COUNT" -gt 0 ]; then
-              FAILED=1
-            fi
+            echo "- \`${FILE}\`: ${COUNT} fixable HIGH/CRITICAL" >> "$GITHUB_STEP_SUMMARY"
           done
-          if [ "$FAILED" -ne 0 ]; then
-            echo "::error::Fixable HIGH/CRITICAL CVEs found in ${{ matrix.image_name }} — see the job log and the Security tab."
-            exit 1
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "::warning::${TOTAL} fixable HIGH/CRITICAL CVE(s) in ${{ matrix.image_name }} — the release was NOT blocked; triage under Security → Code scanning."
+            echo "Triage under **Security → Code scanning**, category \`${{ matrix.image_name }}-linux-<arch>\`. The release was not blocked." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No fixable HIGH/CRITICAL CVEs on any scanned platform." >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "No fixable HIGH/CRITICAL CVEs on any published platform."
 
       - name: Generate service summary
         if: always()
