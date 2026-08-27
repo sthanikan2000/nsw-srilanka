@@ -1,7 +1,16 @@
 # musl base. Every native addon this build needs (@swc/core, @tailwindcss/oxide,
 # lightningcss, @rolldown/binding) has a `libc: [musl]` variant pinned in
 # pnpm-lock.yaml, which is what --frozen-lockfile resolves to here.
-FROM node:22-alpine3.24 AS builder
+#
+# Pinned to $BUILDPLATFORM because `pnpm build` emits only text assets (JS, CSS,
+# HTML, JSON) — dist/ carries no native binary, so one build serves every target
+# arch. That keeps Node, Vite and the arch-specific native addons above entirely
+# on the build host: a multi-arch build resolves only the build host's musl
+# variant and never runs the toolchain under emulation. BuildKit collapses this
+# whole stage to a single shared step, so it executes once no matter how many
+# platforms are requested; only the nginx stage below is built per platform.
+# The --platform flag on a FROM line requires BuildKit (see CONTRIBUTING.md).
+FROM --platform=$BUILDPLATFORM node:22-alpine3.24 AS builder
 
 WORKDIR /workspace
 
