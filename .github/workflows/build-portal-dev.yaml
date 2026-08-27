@@ -3,7 +3,7 @@ name: Build Portal Dev Image
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, test/multiarch-fork ]
     paths:
       - 'portals/**'
       - '.github/workflows/build-portal-dev.yaml'

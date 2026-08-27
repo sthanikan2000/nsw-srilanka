@@ -6,7 +6,7 @@ name: Build Migrate Dev Image
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, test/multiarch-fork ]
     paths:
       - 'migrations/**'
       - 'Dockerfile'
