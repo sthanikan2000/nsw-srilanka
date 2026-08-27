@@ -1,7 +1,13 @@
 # The Alpine Go image is alpine:3.24 plus ca-certificates — it ships no git and
 # no compiler. Neither is needed: modules arrive from GOPROXY as zips, and every
 # build below sets CGO_ENABLED=0, so nothing links libc.
-FROM golang:1.27-alpine3.24 AS builder
+#
+# Pinned to $BUILDPLATFORM so this stage always runs natively on the machine
+# doing the build, never under emulation. Go cross-compiles to the target arch
+# from the GOOS/GOARCH below, so a multi-arch build reuses one native toolchain
+# instead of running an emulated compiler once per platform. The --platform flag
+# on a FROM line requires BuildKit (see CONTRIBUTING.md).
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.24 AS builder
 
 WORKDIR /src
 
@@ -14,9 +20,12 @@ RUN GOWORK=off go mod download
 # Copy the full source tree
 COPY . .
 
-# BuildKit populates TARGETOS/TARGETARCH for cross/multi-arch builds. When they
-# are empty (e.g. no BuildKit), leaving GOOS/GOARCH unset lets Go target the
-# builder's native platform — avoids forcing amd64 emulation on arm64 hosts.
+# BuildKit populates TARGETOS/TARGETARCH with the platform of the image being
+# built, which differs from this stage's own platform (pinned to $BUILDPLATFORM
+# above) whenever the build is cross-arch. Declaring them here rather than higher
+# up is deliberate: every layer above is platform-independent, so `go mod
+# download` and the source COPY are computed once and shared across all target
+# platforms — only the two go build layers below duplicate, once per target arch.
 ARG TARGETOS
 ARG TARGETARCH
 ARG BUILD_VERSION=dev
@@ -34,12 +43,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOWORK=off \
 # go-sqlite3, but we only drive postgres (pure-Go pgx), so sqlite stays an unused
 # runtime stub. We use `go build -o` rather than `go install`, because
 # `go install` refuses to write the binary when cross-compiling for a non-host
-# GOOS/GOARCH (multi-arch buildx).
+# GOOS/GOARCH (multi-arch buildx) — a constraint that now binds on every
+# cross-arch target, since this stage is pinned to $BUILDPLATFORM and a
+# two-platform build always has one. Do not "simplify" it back to go install.
 # -------------------------------------------------------------------
-FROM golang:1.27-alpine3.24 AS migrate-builder
-
-ARG TARGETOS
-ARG TARGETARCH
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.24 AS migrate-builder
 
 # Kept above the MIGRATE_VERSION ARG so a version bump invalidates only the
 # fetch+build layer below, not these steps. The GOPROXY path needs no git; it is
@@ -56,6 +64,14 @@ RUN GOWORK=off go mod init migrate-build
 # package .../backend/cmd/migrate", because backend/ is carved out of the root
 # module by its own go.mod. Publishing `backend/v0.3.0` upstream would make the
 # plain tag usable here.
+# TARGETOS/TARGETARCH are declared here rather than at the top of the stage on
+# purpose: a declared ARG enters the environment of every RUN below it, which
+# makes those layers platform-specific even when they never read it. Keeping them
+# down here lets `apk add git` and `go mod init` above be computed once and shared
+# by every target platform. The fetch below stays fused to the build (see the
+# MIGRATE_VERSION note) so it does still run per platform.
+ARG TARGETOS
+ARG TARGETARCH
 ARG MIGRATE_VERSION=v0.0.0-20260827070610-a0c2d032a061
 RUN GOWORK=off go get github.com/OpenNSW/agency/backend/cmd/migrate@${MIGRATE_VERSION} \
     && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOWORK=off \
