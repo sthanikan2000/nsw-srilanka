@@ -195,9 +195,30 @@ jobs:
           # provenance and sbom attach SLSA build attestations to the image in GHCR.
           provenance: mode=max
           sbom: true
-          # Scope cache per image so the two matrix builds don't overwrite each other's layers.
-          cache-from: type=gha,scope=${{ matrix.image_name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}
+          # A release is built cold, on purpose — no cache-from, no cache-to.
+          #
+          # The layer cache is keyed on instructions, not on what the instructions
+          # produced, so a cached `apk add`/`FROM` layer keeps being served after
+          # the upstream base image is rebuilt. A release could therefore inherit a
+          # base layer carrying a CVE that upstream has already patched, while
+          # Trivy reports the stale contents as the shipped truth. That is exactly
+          # the situation CVE-2026-14456 put us in: Alpine shipped openssl
+          # 3.5.8-r0 while the alpine:3.24 image still carried 3.5.7-r0.
+          #
+          # A release is also the one build whose provenance has to mean something:
+          # `provenance: mode=max` and `sbom: true` above describe THIS run, and
+          # importing layers built by an earlier run with a different base makes
+          # those attestations describe something that was never built in one
+          # piece. Dev and PR builds keep their caches; they are for speed, and
+          # nothing is shipped from them.
+          #
+          # no-cache also stops a future cache-from from quietly re-enabling reuse.
+          # It does not defeat the $BUILDPLATFORM sharing in the Dockerfiles —
+          # vertex dedup within a single build is unrelated to cache import.
+          no-cache: true
+          # Re-resolve every FROM against the registry rather than trusting
+          # whatever the runner already has, so a rebuilt base tag is picked up.
+          pull: true
 
       # Write the image digest to a file so the collate job can bundle it
       # into release-digests.json for gitops.yaml to consume.
