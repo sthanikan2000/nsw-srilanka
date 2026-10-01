@@ -92,3 +92,4 @@ pnpm add -w prettier -D
 - 🔒 **Stricter** - prevents phantom dependencies
 - 🎯 **Single lock file** - better for monorepos
 - ✅ **Industry standard** - used by Vue, Vite, Svelte, and more
+
