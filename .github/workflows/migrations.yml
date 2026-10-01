@@ -2,8 +2,10 @@ name: Migration Check
 # Checks the SQL migrations, on PRs to main and in the merge queue, when
 # migrations/, the migrator pin in the Dockerfile or this check change;
 # otherwise the check is skipped. It applies them to PostgreSQL with the
-# migrator the tnsw-migrate image ships: a fresh install, an upgrade from the
-# base branch, and a rollback and re-apply of the migrations the change adds.
+# migrator version the tnsw-migrate image pins: a fresh install, and an
+# upgrade from the base branch in which each migration the change adds is
+# applied, rolled back and compared with the schema from before it, then
+# applied again.
 
 on:
   pull_request:
@@ -37,7 +39,9 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           PATTERN: '^migrations/|^Dockerfile$|^\.github/workflows/migrations\.yml$|^\.github/scripts/(check|test)-migrations\.sh$'
         run: |
-          FILES=$(git diff --name-only "$BASE...$HEAD")
+          # --no-renames lists both paths of a rename, so a file moved out of a
+          # watched path still counts as a change to it.
+          FILES=$(git diff --no-renames --name-only "$BASE...$HEAD")
           if grep -qE "$PATTERN" <<< "$FILES"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -70,10 +74,11 @@ jobs:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
     steps:
+      # HEAD and its parents are all the checks read.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       # On a PR, HEAD is GitHub's preview of the merge, so HEAD^ is the base
       # branch. In the merge queue, each PR is one squash commit, so HEAD^ is
@@ -81,20 +86,36 @@ jobs:
       - name: Check names, numbering and existing migrations
         run: bash .github/scripts/check-migrations.sh HEAD^
 
+      # The module cache is keyed on the Dockerfile, where the migrator is pinned.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: Dockerfile
 
-      # The version the Dockerfile pins for the tnsw-migrate image.
+      # The version the Dockerfile pins for the tnsw-migrate image. When the
+      # change moves the pin, the base's version is installed too, so the
+      # upgrade pass applies the base's migrations with the migrator that
+      # created existing databases.
       - name: Install the migrator
         env:
           GOWORK: off
         run: |
-          VERSION=$(sed -n 's/^ARG MIGRATE_VERSION=//p' Dockerfile)
+          pin() { sed -n 's/^ARG MIGRATE_VERSION=//p'; }
+          VERSION=$(pin < Dockerfile)
+          BASE_VERSION=$(git show HEAD^:Dockerfile | pin)
           go install "github.com/OpenNSW/agency/backend/cmd/migrate@${VERSION}"
           echo "Migrator ${VERSION}"
+          if [ -n "$BASE_VERSION" ] && [ "$BASE_VERSION" != "$VERSION" ]; then
+            GOBIN="${RUNNER_TEMP}/base-migrator" go install "github.com/OpenNSW/agency/backend/cmd/migrate@${BASE_VERSION}"
+            echo "BASE_MIGRATE=${RUNNER_TEMP}/base-migrator/migrate" >> "$GITHUB_ENV"
+            echo "Base migrator ${BASE_VERSION}"
+          fi
 
+      # Schemas are dumped inside the service container, so pg_dump matches
+      # the server's version.
       - name: Apply, upgrade and roll back
+        env:
+          PG_DUMP: docker exec -e PGPASSWORD -e PGSSLMODE ${{ job.services.postgres.id }} pg_dump
         run: bash .github/scripts/test-migrations.sh HEAD^
