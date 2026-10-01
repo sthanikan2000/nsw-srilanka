@@ -24,3 +24,4 @@ CREATE TABLE IF NOT EXISTS refid_random (
 -- @DOWN
 DROP TABLE IF EXISTS refid_random;
 DROP TABLE IF EXISTS refid_sequences;
+-- edited
