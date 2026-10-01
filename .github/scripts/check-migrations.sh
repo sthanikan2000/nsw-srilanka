@@ -13,6 +13,12 @@
 set -euo pipefail
 
 base="${1:?usage: check-migrations.sh BASE}"
+cd "$(git rev-parse --show-toplevel)"
+if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+  echo "check-migrations.sh: '${base}' is not a commit in this repository; fetch it first." >&2
+  exit 1
+fi
+
 errors=0
 fail() { echo "$1" >&2; errors=$((errors + 1)); }
 # File names in a directory, in sorted order.
