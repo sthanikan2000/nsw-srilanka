@@ -289,3 +289,4 @@ The `OpenNSW/core` SDK provides all the infrastructure building blocks used by t
 | `configs/config.yaml`          | Server config file (mandatory; `CONFIG_PATH`) — reference ID formats (`refid`)   | `configs/config.example.yaml`          |
 
 Workflow execution mechanics (input/output mappings, task plugins, render projections) are documented in [WORKFLOW_GUIDE.md](docs/WORKFLOW_GUIDE.md) and the `github.com/OpenNSW/core` README.
+
